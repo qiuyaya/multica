@@ -392,6 +392,22 @@ func (q *Queries) RemoveSquadMember(ctx context.Context, arg RemoveSquadMemberPa
 	return err
 }
 
+const transferSquadAssignees = `-- name: TransferSquadAssignees :exec
+UPDATE issue SET assignee_type = 'agent', assignee_id = $2, updated_at = now()
+WHERE assignee_type = 'squad' AND assignee_id = $1
+`
+
+type TransferSquadAssigneesParams struct {
+	AssigneeID   pgtype.UUID `json:"assignee_id"`
+	AssigneeID_2 pgtype.UUID `json:"assignee_id_2"`
+}
+
+// Transfer all issues assigned to a squad to the squad's leader agent.
+func (q *Queries) TransferSquadAssignees(ctx context.Context, arg TransferSquadAssigneesParams) error {
+	_, err := q.db.Exec(ctx, transferSquadAssignees, arg.AssigneeID, arg.AssigneeID_2)
+	return err
+}
+
 const updateSquad = `-- name: UpdateSquad :one
 UPDATE squad SET
     name = COALESCE($2, name),

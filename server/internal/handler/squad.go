@@ -88,6 +88,31 @@ func squadActivityLogToResponse(l db.SquadActivityLog) SquadActivityLogResponse 
 	}
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+// loadSquadInWorkspace loads a squad scoped to the current workspace.
+func (h *Handler) loadSquadInWorkspace(w http.ResponseWriter, r *http.Request) (db.Squad, string, bool) {
+	workspaceID := workspaceIDFromURL(r, "workspaceId")
+	squadID := chi.URLParam(r, "id")
+	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	if !ok {
+		return db.Squad{}, "", false
+	}
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
+	if !ok {
+		return db.Squad{}, "", false
+	}
+	squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+		ID:          squadUUID,
+		WorkspaceID: wsUUID,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "squad not found")
+		return db.Squad{}, "", false
+	}
+	return squad, workspaceID, true
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 func (h *Handler) ListSquads(w http.ResponseWriter, r *http.Request) {
@@ -182,24 +207,8 @@ func (h *Handler) CreateSquad(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetSquad(w http.ResponseWriter, r *http.Request) {
-	workspaceID := workspaceIDFromURL(r, "workspaceId")
-	squadID := chi.URLParam(r, "id")
-
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
 	if !ok {
-		return
-	}
-	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
-	if !ok {
-		return
-	}
-
-	squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
-		ID:          squadUUID,
-		WorkspaceID: wsUUID,
-	})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "squad not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, squadToResponse(squad))
@@ -211,21 +220,12 @@ func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	squadID := chi.URLParam(r, "id")
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
 	if !ok {
 		return
 	}
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
 	if !ok {
-		return
-	}
-
-	// Verify squad exists in workspace.
-	if _, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
-		ID: squadUUID, WorkspaceID: wsUUID,
-	}); err != nil {
-		writeError(w, http.StatusNotFound, "squad not found")
 		return
 	}
 
@@ -239,7 +239,7 @@ func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params := db.UpdateSquadParams{ID: squadUUID}
+	params := db.UpdateSquadParams{ID: squad.ID}
 	if req.Name != nil {
 		params.Name = pgtype.Text{String: *req.Name, Valid: true}
 	}
@@ -258,10 +258,19 @@ func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "leader must be a valid agent in this workspace")
 			return
 		}
+		// Ensure new leader is a squad member; auto-add if not.
+		isMember, _ := h.Queries.IsSquadMember(r.Context(), db.IsSquadMemberParams{
+			SquadID: squad.ID, MemberType: "agent", MemberID: lid,
+		})
+		if !isMember {
+			h.Queries.AddSquadMember(r.Context(), db.AddSquadMemberParams{
+				SquadID: squad.ID, MemberType: "agent", MemberID: lid, Role: "leader",
+			})
+		}
 		params.LeaderID = lid
 	}
 
-	squad, err := h.Queries.UpdateSquad(r.Context(), params)
+	updated, err := h.Queries.UpdateSquad(r.Context(), params)
 	if err != nil {
 		if isUniqueViolation(err) {
 			writeError(w, http.StatusConflict, "squad name already exists")
@@ -271,7 +280,7 @@ func (h *Handler) UpdateSquad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := squadToResponse(squad)
+	resp := squadToResponse(updated)
 	h.publish(protocol.EventSquadUpdated, workspaceID, "member", requestUserID(r), map[string]any{"squad": resp})
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -282,34 +291,26 @@ func (h *Handler) DeleteSquad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	squadID := chi.URLParam(r, "id")
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
-	if !ok {
-		return
-	}
-	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
 	if !ok {
 		return
 	}
 
-	squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
-		ID: squadUUID, WorkspaceID: wsUUID,
-	})
-	if err != nil {
-		writeError(w, http.StatusNotFound, "squad not found")
-		return
+	// Transfer issues assigned to this squad to the leader agent.
+	if err := h.Queries.TransferSquadAssignees(r.Context(), db.TransferSquadAssigneesParams{
+		AssigneeID:   squad.ID,
+		AssigneeID_2: squad.LeaderID,
+	}); err != nil {
+		slog.Warn("transfer squad assignees failed", "squad_id", uuidToString(squad.ID), "error", err)
 	}
 
-	// Transfer assignee of issues assigned to this squad to the leader.
-	// (handled by the caller or a separate migration/backfill if needed)
-
-	if err := h.Queries.DeleteSquad(r.Context(), squadUUID); err != nil {
+	if err := h.Queries.DeleteSquad(r.Context(), squad.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete squad")
 		return
 	}
 
 	h.publish(protocol.EventSquadDeleted, workspaceID, "member", requestUserID(r), map[string]any{
-		"squad_id":  squadID,
+		"squad_id":  uuidToString(squad.ID),
 		"leader_id": uuidToString(squad.LeaderID),
 	})
 	w.WriteHeader(http.StatusNoContent)
@@ -318,12 +319,11 @@ func (h *Handler) DeleteSquad(w http.ResponseWriter, r *http.Request) {
 // ── Squad Members ───────────────────────────────────────────────────────────
 
 func (h *Handler) ListSquadMembers(w http.ResponseWriter, r *http.Request) {
-	squadID := chi.URLParam(r, "id")
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
 	if !ok {
 		return
 	}
-	members, err := h.Queries.ListSquadMembers(r.Context(), squadUUID)
+	members, err := h.Queries.ListSquadMembers(r.Context(), squad.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list squad members")
 		return
@@ -341,8 +341,11 @@ func (h *Handler) AddSquadMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	squadID := chi.URLParam(r, "id")
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
+	if !ok {
+		return
+	}
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
 	if !ok {
 		return
 	}
@@ -370,8 +373,25 @@ func (h *Handler) AddSquadMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate the member belongs to this workspace.
+	if req.MemberType == "agent" {
+		if _, err := h.Queries.GetAgentInWorkspace(r.Context(), db.GetAgentInWorkspaceParams{
+			ID: memberUUID, WorkspaceID: wsUUID,
+		}); err != nil {
+			writeError(w, http.StatusBadRequest, "agent not found in this workspace")
+			return
+		}
+	} else {
+		if _, err := h.Queries.GetMemberByUserAndWorkspace(r.Context(), db.GetMemberByUserAndWorkspaceParams{
+			UserID: memberUUID, WorkspaceID: wsUUID,
+		}); err != nil {
+			writeError(w, http.StatusBadRequest, "member not found in this workspace")
+			return
+		}
+	}
+
 	sm, err := h.Queries.AddSquadMember(r.Context(), db.AddSquadMemberParams{
-		SquadID:    squadUUID,
+		SquadID:    squad.ID,
 		MemberType: req.MemberType,
 		MemberID:   memberUUID,
 		Role:       req.Role,
@@ -394,8 +414,7 @@ func (h *Handler) RemoveSquadMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	squadID := chi.URLParam(r, "id")
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
 	if !ok {
 		return
 	}
@@ -415,18 +434,13 @@ func (h *Handler) RemoveSquadMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Prevent removing the leader.
-	squad, err := h.Queries.GetSquad(r.Context(), squadUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "squad not found")
-		return
-	}
 	if req.MemberType == "agent" && uuidToString(squad.LeaderID) == req.MemberID {
 		writeError(w, http.StatusBadRequest, "cannot remove the squad leader; change leader first")
 		return
 	}
 
 	if err := h.Queries.RemoveSquadMember(r.Context(), db.RemoveSquadMemberParams{
-		SquadID:    squadUUID,
+		SquadID:    squad.ID,
 		MemberType: req.MemberType,
 		MemberID:   memberUUID,
 	}); err != nil {
@@ -443,8 +457,7 @@ func (h *Handler) UpdateSquadMemberRole(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	squadID := chi.URLParam(r, "id")
-	squadUUID, ok := parseUUIDOrBadRequest(w, squadID, "squad id")
+	squad, _, ok := h.loadSquadInWorkspace(w, r)
 	if !ok {
 		return
 	}
@@ -465,7 +478,7 @@ func (h *Handler) UpdateSquadMemberRole(w http.ResponseWriter, r *http.Request) 
 	}
 
 	sm, err := h.Queries.UpdateSquadMemberRole(r.Context(), db.UpdateSquadMemberRoleParams{
-		SquadID:    squadUUID,
+		SquadID:    squad.ID,
 		MemberType: req.MemberType,
 		MemberID:   memberUUID,
 		Role:       req.Role,
@@ -482,13 +495,14 @@ func (h *Handler) UpdateSquadMemberRole(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) ListSquadActivityLogs(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "issueId")
-	issueUUID, ok := parseUUIDOrBadRequest(w, issueID, "issue_id")
+	// Validate issue belongs to current workspace.
+	issue, ok := h.loadIssueForUser(w, r, issueID)
 	if !ok {
 		return
 	}
 
 	logs, err := h.Queries.ListSquadActivityLogs(r.Context(), db.ListSquadActivityLogsParams{
-		IssueID: issueUUID,
+		IssueID: issue.ID,
 		Limit:   50,
 	})
 	if err != nil {
@@ -507,6 +521,10 @@ func (h *Handler) CreateSquadActivityLog(w http.ResponseWriter, r *http.Request)
 	workspaceID := workspaceIDFromURL(r, "workspaceId")
 	if workspaceID == "" {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
+		return
+	}
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace_id")
+	if !ok {
 		return
 	}
 
@@ -536,19 +554,39 @@ func (h *Handler) CreateSquadActivityLog(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Validate squad belongs to this workspace.
+	squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+		ID:          squadUUID,
+		WorkspaceID: wsUUID,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "squad not found in this workspace")
+		return
+	}
+
+	// Validate issue belongs to this workspace.
+	if _, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+		ID:          issueUUID,
+		WorkspaceID: wsUUID,
+	}); err != nil {
+		writeError(w, http.StatusNotFound, "issue not found in this workspace")
+		return
+	}
+
+	// Security: only the squad leader agent can write activity logs.
+	userID := requestUserID(r)
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	if actorType != "agent" || actorID != uuidToString(squad.LeaderID) {
+		writeError(w, http.StatusForbidden, "only the squad leader agent can record activity")
+		return
+	}
+
 	var triggerCommentUUID pgtype.UUID
 	if req.TriggerCommentID != "" {
 		triggerCommentUUID, ok = parseUUIDOrBadRequest(w, req.TriggerCommentID, "trigger_comment_id")
 		if !ok {
 			return
 		}
-	}
-
-	// Get squad to find leader.
-	squad, err := h.Queries.GetSquad(r.Context(), squadUUID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "squad not found")
-		return
 	}
 
 	var detailsJSON []byte

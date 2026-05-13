@@ -71,3 +71,8 @@ SELECT * FROM squad_activity_log
 WHERE issue_id = $1
 ORDER BY created_at DESC
 LIMIT $2;
+
+-- name: TransferSquadAssignees :exec
+-- Transfer all issues assigned to a squad to the squad's leader agent.
+UPDATE issue SET assignee_type = 'agent', assignee_id = $2, updated_at = now()
+WHERE assignee_type = 'squad' AND assignee_id = $1;

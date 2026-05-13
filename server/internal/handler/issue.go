@@ -1636,8 +1636,16 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 			return http.StatusForbidden, "cannot assign to private agent"
 		}
 		return 0, ""
+	case "squad":
+		if _, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
+			ID:          assigneeID,
+			WorkspaceID: wsUUID,
+		}); err != nil {
+			return http.StatusBadRequest, "assignee_id does not refer to a squad in this workspace"
+		}
+		return 0, ""
 	default:
-		return http.StatusBadRequest, "assignee_type must be 'member' or 'agent'"
+		return http.StatusBadRequest, "assignee_type must be 'member', 'agent', or 'squad'"
 	}
 }
 
